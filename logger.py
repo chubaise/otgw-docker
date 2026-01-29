@@ -21,13 +21,13 @@ TOPIC_ERROR = os.getenv('MQTT_TOPIC_ERROR', "otgw/error")
 TG_TOKEN = os.getenv('TG_TOKEN', None)
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', None)
 
-# Интервал отчета: 6 часов
-REPORT_INTERVAL = 6 * 3600 
+# Интервал отчета: 1 час (3600 секунд)
+REPORT_INTERVAL = 3600 
 
 LOG_DIR = "/logs"
 ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+verbose_pattern = re.compile(r'ID:\s*(\d+).*Response:\s*([0-9a-fA-F]{8})')
 
-# СЛОВАРЬ ОШИБОК
 ERROR_CODES = {
     "Error 01": "Ошибка четности (Помехи/контакт)",
     "Error 02": "Ошибка Stop-бита (Синхронизация)",
@@ -35,13 +35,12 @@ ERROR_CODES = {
     "Error 04": "Неизвестный формат"
 }
 
-# Хранилище состояния
 status = {
     "t_boiler": "---",
     "t_room": "---",
     "pressure": "---",
     "modulation": "---",
-    "last_error": None
+    "errors_set": set()
 }
 
 # --- ЛОГГЕР ---
@@ -65,16 +64,33 @@ def ot_float(hex_str):
         return round(val / 256.0, 1)
     except: return 0.0
 
-def parse_opentherm(line):
-    if len(line) != 9 or line[0] not in ['T', 'B', 'R', 'A']: return
+def update_status(msg_id, data_hex):
+    """Только обновляем память для Телеграма, в MQTT не шлем"""
     try:
-        msg_id = int(line[3:5], 16)
-        data_hex = line[5:9]
-        if msg_id == 25: status["t_boiler"] = ot_float(data_hex)
-        elif msg_id == 24: status["t_room"] = ot_float(data_hex)
-        elif msg_id == 18: status["pressure"] = ot_float(data_hex)
-        elif msg_id == 17: status["modulation"] = ot_float(data_hex)
+        val = ot_float(data_hex)
+        if msg_id == 25: status["t_boiler"] = val
+        elif msg_id == 24: status["t_room"] = val
+        elif msg_id == 18: status["pressure"] = val
+        elif msg_id == 17: status["modulation"] = val
     except: pass
+
+def parse_opentherm(line):
+    if len(line) == 9 and line[0] in ['T', 'B', 'R', 'A']:
+        try:
+            msg_id = int(line[3:5], 16)
+            data_hex = line[5:9]
+            update_status(msg_id, data_hex)
+        except: pass
+        return
+    
+    match = verbose_pattern.search(line)
+    if match:
+        try:
+            msg_id = int(match.group(1))
+            full_response = match.group(2)
+            data_hex = full_response[4:8]
+            update_status(msg_id, data_hex)
+        except: pass
 
 def send_telegram(message, silent=False):
     if TG_TOKEN and TG_CHAT_ID:
@@ -85,19 +101,16 @@ def send_telegram(message, silent=False):
         except: pass
 
 def send_status_report():
-    # Формируем строку ошибки для 2-й строки
-    if status['last_error']:
-        # Если была ошибка - показываем её
-        err_desc = ERROR_CODES.get(status['last_error'], status['last_error'])
-        error_line = f"⚠️ Ошибки: *{err_desc}*"
-        # Сбрасываем ошибку после отчета (или оставить, если хотите помнить вечно)
-        status['last_error'] = None 
+    if status['errors_set']:
+        err_list = [f"• `{err}`: _{ERROR_CODES.get(err, 'Неизвестная')}_" for err in status['errors_set']]
+        error_block = "⚠️ *Зафиксированы ошибки:*\n" + "\n".join(err_list)
+        status['errors_set'].clear()
     else:
-        error_line = "✅ Ошибки: *Нет (Норма)*"
+        error_block = "✅ Ошибки: *Нет (Норма)*"
 
     msg = (
-        f"📊 *Отчет о состоянии (6ч)*\n"
-        f"{error_line}\n"                 # <--- 2-я строка как просили
+        f"📊 *Отчет (1ч)*\n"
+        f"{error_block}\n\n"
         f"🌡 Комната: *{status['t_room']} °C*\n"
         f"🔥 Котел: *{status['t_boiler']} °C*\n"
         f"📈 Мощность: *{status['modulation']} %*\n"
@@ -125,7 +138,7 @@ def main():
     except: print("MQTT Error")
 
     print("Starting...")
-    send_telegram("🔄 Мониторинг перезапущен (v3.0 Final)")
+    send_telegram("🔄 Мониторинг v3.3 (1 час + Only Errors to HA)")
 
     while True:
         s = None
@@ -137,7 +150,6 @@ def main():
             
             buffer = ""
             while True:
-                # Проверка времени для отчета (раз в 6 часов)
                 if time.time() - last_report_time > REPORT_INTERVAL:
                     send_status_report()
                     last_report_time = time.time()
@@ -159,7 +171,7 @@ def main():
 
                         if "Error" in clean_line:
                             print(f"ERROR: {clean_line}")
-                            status['last_error'] = clean_line
+                            status['errors_set'].add(clean_line)
                             desc = ERROR_CODES.get(clean_line, "Неизвестная ошибка")
                             send_telegram(f"⚠️ *АВАРИЯ КОТЛА*\nКод: `{clean_line}`\n_{desc}_")
                             if mqtt_connected: client.publish(TOPIC_ERROR, clean_line)
