@@ -4,6 +4,7 @@ import sys
 import os
 import logging
 import re
+import json
 import requests
 from logging.handlers import TimedRotatingFileHandler
 import paho.mqtt.client as mqtt
@@ -21,29 +22,28 @@ TOPIC_ERROR = os.getenv('MQTT_TOPIC_ERROR', "otgw/error")
 TG_TOKEN = os.getenv('TG_TOKEN', None)
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', None)
 
-# Интервал отчета: 1 час (3600 секунд)
-REPORT_INTERVAL = 3600 
+REPORT_INTERVAL = 3600  # Отчет раз в час
+POLL_INTERVAL = 60      # Опрос котла раз в минуту
 
 LOG_DIR = "/logs"
 ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-verbose_pattern = re.compile(r'ID:\s*(\d+).*Response:\s*([0-9a-fA-F]{8})')
+verbose_pattern = re.compile(r'ID:\s*(\d+).*Response:\s*([0-9a-fA-F]{8})', re.IGNORECASE)
 
 ERROR_CODES = {
-    "Error 01": "Ошибка четности (Помехи/контакт)",
-    "Error 02": "Ошибка Stop-бита (Синхронизация)",
+    "Error 01": "Ошибка четности (Помехи)",
+    "Error 02": "Ошибка Stop-бита",
     "Error 03": "Переполнение буфера",
     "Error 04": "Неизвестный формат"
 }
 
 status = {
     "t_boiler": "---",
-    "t_room": "---",
+    "t_dhw": "---",
     "pressure": "---",
     "modulation": "---",
     "errors_set": set()
 }
 
-# --- ЛОГГЕР ---
 logger = logging.getLogger("OTGW")
 logger.setLevel(logging.INFO)
 hourly_handler = TimedRotatingFileHandler(f"{LOG_DIR}/otgw_hourly.log", when="h", interval=1, backupCount=168)
@@ -55,8 +55,9 @@ logger.addHandler(daily_handler)
 
 mqtt_connected = False
 last_report_time = time.time()
+last_poll_time = 0
+client = mqtt.Client()
 
-# --- ФУНКЦИИ ---
 def ot_float(hex_str):
     try:
         val = int(hex_str, 16)
@@ -64,32 +65,40 @@ def ot_float(hex_str):
         return round(val / 256.0, 1)
     except: return 0.0
 
-def update_status(msg_id, data_hex):
-    """Только обновляем память для Телеграма, в MQTT не шлем"""
+def update_status_hex(msg_id, data_hex):
     try:
         val = ot_float(data_hex)
         if msg_id == 25: status["t_boiler"] = val
-        elif msg_id == 24: status["t_room"] = val
+        elif msg_id == 26: status["t_dhw"] = val
         elif msg_id == 18: status["pressure"] = val
         elif msg_id == 17: status["modulation"] = val
     except: pass
 
-def parse_opentherm(line):
+def parse_line(line):
+    # 1. Поиск JSON (на всякий случай)
+    if '{' in line and '}' in line:
+        try:
+            # Тут можно добавить логику JSON, если понадобится
+            pass
+        except: pass
+
+    # 2. Поиск HEX (Стандарт)
     if len(line) == 9 and line[0] in ['T', 'B', 'R', 'A']:
         try:
             msg_id = int(line[3:5], 16)
             data_hex = line[5:9]
-            update_status(msg_id, data_hex)
+            update_status_hex(msg_id, data_hex)
         except: pass
         return
-    
+
+    # 3. Поиск Verbose (Ваш случай)
     match = verbose_pattern.search(line)
     if match:
         try:
             msg_id = int(match.group(1))
             full_response = match.group(2)
             data_hex = full_response[4:8]
-            update_status(msg_id, data_hex)
+            update_status_hex(msg_id, data_hex)
         except: pass
 
 def send_telegram(message, silent=False):
@@ -111,23 +120,21 @@ def send_status_report():
     msg = (
         f"📊 *Отчет (1ч)*\n"
         f"{error_block}\n\n"
-        f"🌡 Комната: *{status['t_room']} °C*\n"
+        f"🚿 ГВС: *{status['t_dhw']} °C*\n"
         f"🔥 Котел: *{status['t_boiler']} °C*\n"
         f"📈 Мощность: *{status['modulation']} %*\n"
         f"💧 Давление: *{status['pressure']} bar*"
     )
     send_telegram(msg, silent=True)
 
-def on_connect(client, userdata, flags, rc):
+def on_connect(c, userdata, flags, rc):
     global mqtt_connected
     if rc == 0:
         print("Connected to MQTT!")
         mqtt_connected = True
 
-# --- MAIN ---
 def main():
-    global last_report_time
-    client = mqtt.Client()
+    global last_report_time, last_poll_time
     if MQTT_USER and MQTT_PASS:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.on_connect = on_connect
@@ -137,24 +144,47 @@ def main():
         client.loop_start()
     except: print("MQTT Error")
 
-    print("Starting...")
-    send_telegram("🔄 Мониторинг v3.3 (1 час + Only Errors to HA)")
+    print("Starting OTGW Monitor v3.8 (Stable)...")
+    send_telegram("✅ Мониторинг активен (v3.8)")
 
     while True:
         s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10)
+            s.settimeout(5)
             s.connect((OTGW_IP, OTGW_PORT))
             print("Connected to OTGW!")
-            
+            s.sendall(b"PS=1\r\n") 
+
             buffer = ""
             while True:
-                if time.time() - last_report_time > REPORT_INTERVAL:
+                current_time = time.time()
+                
+                # 1. Отчет
+                if current_time - last_report_time > REPORT_INTERVAL:
                     send_status_report()
-                    last_report_time = time.time()
+                    last_report_time = current_time
 
-                data = s.recv(1024)
+                # 2. ОПРОС (Обязателен для вашего котла!)
+                if current_time - last_poll_time > POLL_INTERVAL:
+                    try:
+                        # Спрашиваем главные параметры
+                        s.sendall(b"RR=25\r\n") # Котел
+                        time.sleep(0.1)
+                        s.sendall(b"RR=26\r\n") # ГВС
+                        time.sleep(0.1)
+                        s.sendall(b"RR=18\r\n") # Давление
+                        time.sleep(0.1)
+                        s.sendall(b"RR=17\r\n") # Модуляция
+                    except: pass
+                    last_poll_time = current_time
+
+                # 3. Чтение
+                try:
+                    data = s.recv(1024)
+                except socket.timeout:
+                    continue
+
                 if not data: break
                 
                 try:
@@ -164,25 +194,24 @@ def main():
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         clean_line = ansi_escape.sub('', line).strip()
-                        if not clean_line or clean_line.startswith('['): continue
+                        if not clean_line: continue
                         
                         logger.info(clean_line)
-                        parse_opentherm(clean_line)
-
+                        parse_line(clean_line)
+                        
                         if "Error" in clean_line:
-                            print(f"ERROR: {clean_line}")
                             status['errors_set'].add(clean_line)
-                            desc = ERROR_CODES.get(clean_line, "Неизвестная ошибка")
-                            send_telegram(f"⚠️ *АВАРИЯ КОТЛА*\nКод: `{clean_line}`\n_{desc}_")
                             if mqtt_connected: client.publish(TOPIC_ERROR, clean_line)
 
                 except: pass
+
         except socket.error:
-            print("Socket lost")
-        except: pass
+            print("Connection lost, retrying...")
+            time.sleep(10)
+        except Exception:
+            time.sleep(10)
         finally:
             if s: s.close()
-            time.sleep(10)
 
 if __name__ == "__main__":
     main()

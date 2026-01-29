@@ -1,4 +1,4 @@
-# OTGW Logger & Monitor v3.3
+# OTGW Logger & Monitor v3.8 Final: Active polling enabled, debug removed
 
 Docker-контейнер для мониторинга котла через OpenTherm Gateway.
 
