@@ -60,7 +60,7 @@ status = {
     "modulation": "---",
     "is_boiler_fault": False,
     "last_fault_code": None,
-    "low_pressure_alert": False, # Флаг аварии по давлению
+    "low_pressure_alert": False,
     "errors_set": set()
 }
 
@@ -75,7 +75,8 @@ logger.addHandler(daily_handler)
 
 mqtt_connected = False
 last_report_time = time.time()
-last_poll_time = 0
+# ВАЖНО: Инициализируем текущим временем, чтобы не спамить сразу при старте
+last_poll_time = time.time() 
 client = mqtt.Client()
 
 def ot_float(hex_str):
@@ -94,7 +95,6 @@ def send_telegram(message, silent=False):
         except: pass
 
 def check_pressure(val):
-    # Если давление упало ниже минимума
     if val < MIN_PRESSURE and not status["low_pressure_alert"]:
         status["low_pressure_alert"] = True
         msg = (f"💧 <b>АВАРИЯ ДАВЛЕНИЯ!</b>\n"
@@ -105,7 +105,6 @@ def check_pressure(val):
         print(f"!!! LOW PRESSURE: {val} bar !!!")
         if mqtt_connected: client.publish(TOPIC_ERROR, "LOW_PRESSURE")
 
-    # Если давление вернулось в норму
     elif val >= MIN_PRESSURE and status["low_pressure_alert"]:
         status["low_pressure_alert"] = False
         send_telegram(f"✅ <b>Давление в норме</b>: {val} bar")
@@ -116,7 +115,7 @@ def update_status(key, val):
         val = float(val)
         if key == 'pressure':
              status['pressure'] = val
-             check_pressure(val) # <--- ПРОВЕРКА ДАВЛЕНИЯ
+             check_pressure(val)
         elif key in ['t_boiler', 'boiler_temp', 'tr', 'temperature']:
              status['t_boiler'] = val
         elif key in ['t_dhw', 'dhw_temp', 'dhw']:
@@ -161,7 +160,7 @@ def check_boiler_fault(line):
                 client.publish(TOPIC_BOILER_STATE, "ok")
 
 def parse_line(line):
-    # 1. Текстовое давление (из логов 28-го числа)
+    # 1. Текстовое давление
     p_match = text_pressure_pattern.search(line)
     if p_match:
         try: update_status('pressure', float(p_match.group(1)))
@@ -171,21 +170,16 @@ def parse_line(line):
     if "boiler status" in line.lower() or "fault" in line.lower():
         check_boiler_fault(line)
 
-    # 3. JSON (восстановлено!)
+    # 3. JSON
     if '{' in line and '}' in line:
         try:
-            # Ищем самый глубокий JSON
-            json_str = line[line.find('{'):line.rfind('}')+1]
-            data = json.loads(json_str)
-            
-            # Рекурсивный поиск значений
+            data = json.loads(line[line.find('{'):line.rfind('}')+1])
             def extract(d):
                 for k, v in d.items():
                     if isinstance(v, dict): extract(v)
                     else:
-                        # Маппинг ключей из JSON
                         if k in ['pressure', 'pr', 'water_pressure']: update_status('pressure', v)
-                        elif k in ['value'] and 'Pressure' in line: update_status('pressure', v) # Иногда просто value
+                        elif k in ['value'] and 'Pressure' in line: update_status('pressure', v)
                         elif k in ['boiler_temp', 'tr', 'temperature', 'ch_temp']: update_status('t_boiler', v)
                         elif k in ['dhw_temp', 'dhw', 'dhw_current']: update_status('t_dhw', v)
                         elif k in ['modulation', 'mod', 'rel_mod']: update_status('modulation', v)
@@ -211,7 +205,6 @@ def send_status_report():
     else:
         error_block = "✅ Связь: <b>Норма</b>"
 
-    # Статус котла
     if status["is_boiler_fault"]:
         code = status['last_fault_code']
         desc = AMPERA_ERRORS.get(code, f"Код {code}") if code else "Нет данных"
@@ -250,16 +243,18 @@ def main():
         client.loop_start()
     except: print("MQTT Error")
 
-    print("Starting OTGW Monitor v3.13 (Pressure Logic + JSON)...")
-    send_telegram("🔄 Мониторинг v3.13 (Контроль Давления)")
+    print("Starting OTGW Monitor v3.14 (Stable Connection)...")
+    send_telegram("🔄 Мониторинг v3.14 (Soft Start)")
 
     while True:
         s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
+            s.settimeout(15) # Увеличенный таймаут
             s.connect((OTGW_IP, OTGW_PORT))
             print("Connected to OTGW!")
+            
+            time.sleep(1) # Даем соединению устояться
             s.sendall(b"PS=1\r\n") 
 
             buffer = ""
@@ -273,15 +268,15 @@ def main():
                 if current_time - last_poll_time > POLL_INTERVAL:
                     try:
                         s.sendall(b"RR=0\r\n") 
-                        time.sleep(0.1)
+                        time.sleep(0.2)
                         s.sendall(b"RR=115\r\n") 
-                        time.sleep(0.1)
+                        time.sleep(0.2)
                         s.sendall(b"RR=25\r\n") 
-                        time.sleep(0.1)
+                        time.sleep(0.2)
                         s.sendall(b"RR=26\r\n") 
-                        time.sleep(0.1)
+                        time.sleep(0.2)
                         s.sendall(b"RR=18\r\n") 
-                        time.sleep(0.1)
+                        time.sleep(0.2)
                         s.sendall(b"RR=17\r\n") 
                     except: pass
                     last_poll_time = current_time
@@ -311,10 +306,8 @@ def main():
 
                 except: pass
 
-        except socket.error:
-            print("Connection lost, retrying...")
-            time.sleep(10)
-        except Exception:
+        except Exception as e:
+            print(f"Connection lost: {e}. Retrying in 10s...")
             time.sleep(10)
         finally:
             if s: s.close()

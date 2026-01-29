@@ -1,4 +1,4 @@
-# OTGW Logger & Monitor v3.13 - Контроль Давления + JSON
+# OTGW Logger & Monitor v3.14
 
 Docker-контейнер для мониторинга котла через OpenTherm Gateway.
 
