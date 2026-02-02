@@ -1,16 +1,9 @@
-version: '3'
 services:
   otgw-logger:
-    image: python:3.11-alpine
+    build: .
     container_name: otgw_logger
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
-    environment:
-      - TZ=Europe/Moscow
-    command: >
-      sh -c "pip install paho-mqtt requests && 
-      python -u /app/logger.py"
     volumes:
       - ./logs:/logs
-      - ./logger.py:/app/logger.py
