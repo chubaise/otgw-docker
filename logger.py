@@ -9,7 +9,7 @@ import requests
 from logging.handlers import TimedRotatingFileHandler
 import paho.mqtt.client as mqtt
 
-# --- ЧИТАЕМ НАСТРОЙКИ ИЗ .ENV ---
+# --- SETTINGS ---
 OTGW_IP = os.getenv('OTGW_IP', '127.0.0.1')
 OTGW_PORT = int(os.getenv('OTGW_PORT', 23))
 
@@ -18,18 +18,20 @@ MQTT_PORT = int(os.getenv('MQTT_PORT', 1883))
 MQTT_USER = os.getenv('MQTT_USER', None)
 MQTT_PASS = os.getenv('MQTT_PASS', None)
 
-# Вот переменная, которую вы искали:
-TOPIC_ERROR = os.getenv('MQTT_TOPIC_ERROR', "otgw/error") 
+# MQTT Topics
+TOPIC_ERROR = "otgw/error"          
+TOPIC_ERROR_TEXT = "otgw/error_text" 
 TOPIC_BOILER_STATE = "otgw/boiler_state"
 
 TG_TOKEN = os.getenv('TG_TOKEN', None)
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', None)
 
 REPORT_INTERVAL = 3600
+WATCHDOG_TIMEOUT = 600
 MIN_PRESSURE = 0.7
 MAX_PRESSURE = 2.8
 
-# Логгер
+# Logger setup
 LOG_DIR = "/logs"
 if not os.path.exists(LOG_DIR): os.makedirs(LOG_DIR)
 logger = logging.getLogger("OTGW")
@@ -41,7 +43,7 @@ daily_handler = TimedRotatingFileHandler(f"{LOG_DIR}/otgw_daily.log", when="midn
 daily_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
 logger.addHandler(daily_handler)
 
-# Регулярные выражения
+# Regex patterns
 ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 text_sensor_pattern = re.compile(r"'([^']+)'\s+new value.*?:\s*([\d\.]+)", re.IGNORECASE)
 text_pressure_pattern = re.compile(r"Pressure.*?value.*?:\s*([\d\.]+)", re.IGNORECASE)
@@ -51,19 +53,12 @@ oem_code_pattern = re.compile(r'OEM fault code:\s*(\d+)', re.IGNORECASE)
 verbose_pattern = re.compile(r'ID:\s*(\d+).*Response:\s*([0-9a-fA-F]{8})', re.IGNORECASE)
 
 AMPERA_ERRORS = {
-    17: "E9 - Отсутствие питания ТЭН / Реле",
-    1:  "E1 - Низкое давление теплоносителя",
-    2:  "E2 - Перегрев / Нет протока",
-    3:  "E3 - Аварийный перегрев",
-    4:  "E4 - Обрыв датчика температуры",
-    5:  "E5 - Обрыв датчика улицы/бойлера"
-}
-
-ERROR_CODES = {
-    "Error 01": "Ошибка четности (Помехи)",
-    "Error 02": "Ошибка Stop-бита",
-    "Error 03": "Переполнение буфера",
-    "Error 04": "Неизвестный формат"
+    17: "E9 - Heater/Relay power failure",
+    1:  "E1 - Low pressure",
+    2:  "E2 - Overheating / No flow",
+    3:  "E3 - Critical overheating",
+    4:  "E4 - Temp sensor failure",
+    5:  "E5 - Outdoor/Boiler sensor failure"
 }
 
 status = {
@@ -71,11 +66,13 @@ status = {
     "t_room": "---", "t_outdoor": "---",
     "pressure": "---", "modulation": "---",
     "is_boiler_fault": False, "last_fault_code": None,
-    "low_pressure_alert": False, "errors_set": set()
+    "low_pressure_alert": False, "errors_set": set(),
+    "connection_alert": False, "emergency_mode": False
 }
 
 mqtt_connected = False
 last_report_time = time.time() - REPORT_INTERVAL + 60
+last_data_time = time.time() 
 context_sensor_name = None
 client = mqtt.Client()
 
@@ -94,15 +91,38 @@ def send_telegram(message, silent=False):
             requests.post(url, json=data, timeout=5)
         except: pass
 
+def mqtt_publish_error(code, text):
+    if mqtt_connected:
+        client.publish(TOPIC_ERROR, code)       
+        client.publish(TOPIC_ERROR_TEXT, text)  
+
 def check_pressure(val):
     if val < MIN_PRESSURE and not status["low_pressure_alert"]:
         status["low_pressure_alert"] = True
-        send_telegram(f"💧 <b>АВАРИЯ ДАВЛЕНИЯ!</b>\nТекущее: <b>{val} bar</b>")
-        if mqtt_connected: client.publish(TOPIC_ERROR, "LOW_PRESSURE")
+        # Telegram with Emoji
+        send_telegram(f"💧 <b>АВАРИЯ ДАВЛЕНИЯ!</b>\nНизкое давление: {val} bar")
+        # MQTT Text (Clean)
+        mqtt_publish_error("LOW_PRESSURE", f"Low pressure: {val} bar")
+
     elif val >= MIN_PRESSURE and status["low_pressure_alert"]:
         status["low_pressure_alert"] = False
         send_telegram(f"✅ <b>Давление в норме</b>: {val} bar")
-        if mqtt_connected: client.publish(TOPIC_ERROR, "OK")
+        mqtt_publish_error("OK", "No errors")
+
+def ping_watchdog():
+    global last_data_time
+    last_data_time = time.time()
+    if status["connection_alert"]:
+        status["connection_alert"] = False
+        send_telegram("✅ <b>Связь со шлюзом восстановлена!</b>")
+        mqtt_publish_error("OK", "Connection restored")
+
+def check_watchdog():
+    if time.time() - last_data_time > WATCHDOG_TIMEOUT and not status["connection_alert"]:
+        status["connection_alert"] = True
+        msg = "No connection to gateway (Timeout)"
+        send_telegram(f"⚠️ <b>НЕТ СВЯЗИ СО ШЛЮЗОМ!</b>\n{msg}")
+        mqtt_publish_error("CONNECTION_LOST", msg)
 
 def update_status(key, val):
     try:
@@ -133,13 +153,16 @@ def update_status(key, val):
              status['t_room'] = val
              updated = True
              
-        if updated: print(f"✅ UPDATE: {key} = {val}")
+        if updated: 
+            print(f"DATA: {key} = {val}")
+            ping_watchdog() 
 
     except: pass
 
 def update_status_hex(msg_id, data_hex):
     try:
         val = ot_float(data_hex)
+        ping_watchdog() 
         if msg_id == 25: update_status('t_boiler', val)
         elif msg_id == 28: update_status('t_return', val)
         elif msg_id == 26: update_status('t_dhw', val)
@@ -151,39 +174,60 @@ def update_status_hex(msg_id, data_hex):
     except: pass
 
 def check_boiler_fault(line):
+    # 1. Check OEM code
+    code_match = oem_code_pattern.search(line)
+    if code_match: 
+        status["last_fault_code"] = int(code_match.group(1))
+
+    # 2. Check Fault bit
     match = fault_pattern.search(line)
     if match:
+        ping_watchdog()
         fault_val = int(match.group(1))
-        code_match = oem_code_pattern.search(line)
-        if code_match: status["last_fault_code"] = int(code_match.group(1))
 
         if fault_val == 1 and not status["is_boiler_fault"]:
             status["is_boiler_fault"] = True
             raw_code = status['last_fault_code']
-            reason = AMPERA_ERRORS.get(raw_code, f"Код {raw_code}") if raw_code else "Неизвестная"
+            reason = AMPERA_ERRORS.get(raw_code, f"Code {raw_code}") if raw_code else "Unknown Error"
+            
+            # Telegram with Emoji
             send_telegram(f"🔥 <b>АВАРИЯ КОТЛА!</b>\nПричина: <b>{reason}</b>")
-            if mqtt_connected: 
-                # Вот здесь мы отправляем ошибку в MQTT
-                client.publish(TOPIC_ERROR, f"FAULT_{raw_code or 'UNK'}")
-                client.publish(TOPIC_BOILER_STATE, "error")
+            
+            mqtt_publish_error(f"FAULT_{raw_code or 'UNK'}", reason)
+            if mqtt_connected: client.publish(TOPIC_BOILER_STATE, "error")
+
         elif fault_val == 0 and status["is_boiler_fault"]:
             status["is_boiler_fault"] = False
             status["last_fault_code"] = None
             send_telegram("✅ <b>Авария котла устранена</b>")
-            if mqtt_connected: 
-                client.publish(TOPIC_ERROR, "OK")
-                client.publish(TOPIC_BOILER_STATE, "ok")
+            mqtt_publish_error("OK", "No errors")
+            if mqtt_connected: client.publish(TOPIC_BOILER_STATE, "ok")
+
+def check_emergency_text(line):
+    if "Emergency mode enabled" in line and not status["emergency_mode"]:
+        status["emergency_mode"] = True
+        # Telegram with Emoji
+        send_telegram("🚨 <b>Аварийный режим (ограничение функционала)</b>")
+        # MQTT Clean Text
+        mqtt_publish_error("EMERGENCY", "Emergency Mode enabled")
+        if mqtt_connected: client.publish(TOPIC_BOILER_STATE, "emergency")
+
+    elif "Emergency mode disabled" in line and status["emergency_mode"]:
+        status["emergency_mode"] = False
+        send_telegram("✅ <b>Аварийный режим отключен</b>")
+        mqtt_publish_error("OK", "No errors")
+        if mqtt_connected: client.publish(TOPIC_BOILER_STATE, "ok")
 
 def parse_line(line):
     global context_sensor_name
-    
-    # 1. Контекст MQTT
+    check_emergency_text(line)
+
     topic_match = topic_pattern.search(line)
     if topic_match:
         context_sensor_name = topic_match.group(1)
+        ping_watchdog()
         return
 
-    # 2. Значение MQTT (используя контекст)
     if '{"value":' in line and context_sensor_name:
         try:
             data = json.loads(line[line.find('{'):line.rfind('}')+1])
@@ -193,57 +237,22 @@ def parse_line(line):
                 context_sensor_name = None
         except: pass
 
-    # 3. Текстовые логи Laxilef
     sensor_match = text_sensor_pattern.search(line)
     if sensor_match:
         update_status(sensor_match.group(1), sensor_match.group(2))
 
-    # 4. Проверка ошибок
-    if "boiler status" in line.lower() or "fault" in line.lower():
+    if "boiler status" in line.lower() or "fault" in line.lower() or "oem" in line.lower():
         check_boiler_fault(line)
 
-    # 5. Pressure fallback
     p_match = text_pressure_pattern.search(line)
     if p_match:
         try: update_status('pressure', float(p_match.group(1)))
         except: pass
 
-    # 6. HEX
     match = verbose_pattern.search(line)
     if match:
         try: update_status_hex(int(match.group(1)), match.group(2)[4:8])
         except: pass
-
-def send_status_report():
-    if status['errors_set']:
-        err_list = [f"• <code>{err}</code>: <i>{ERROR_CODES.get(err, 'Неизвестная')}</i>" for err in status['errors_set']]
-        error_block = "⚠️ <b>Gateway Error:</b>\n" + "\n".join(err_list)
-        status['errors_set'].clear()
-    else:
-        error_block = "✅ Связь: <b>Норма</b>"
-
-    if status["is_boiler_fault"]:
-        code = status['last_fault_code']
-        desc = AMPERA_ERRORS.get(code, f"Код {code}") if code else "Нет данных"
-        boiler_state = f"🔥 <b>АВАРИЯ: {desc}</b>"
-    elif status["low_pressure_alert"]:
-        boiler_state = f"💧 <b>НИЗКОЕ ДАВЛЕНИЕ ({status['pressure']} bar)</b>"
-    else:
-        boiler_state = "✅ Котел: <b>В работе</b>"
-
-    msg = (
-        f"📊 <b>Отчет (1ч)</b>\n"
-        f"{boiler_state}\n"
-        f"{error_block}\n\n"
-        f"🏠 Комната: <b>{status['t_room']} °C</b>\n"
-        f"🌲 Улица: <b>{status['t_outdoor']} °C</b>\n"
-        f"🚿 ГВС: <b>{status['t_dhw']} °C</b>\n"
-        f"🔥 Подача: <b>{status['t_boiler']} °C</b>\n"
-        f"↩️ Обратка: <b>{status['t_return']} °C</b>\n"
-        f"📈 Мощность: <b>{status['modulation']} %</b>\n"
-        f"💧 Давление: <b>{status['pressure']} bar</b>"
-    )
-    send_telegram(msg, silent=True)
 
 def on_connect(c, userdata, flags, rc):
     global mqtt_connected
@@ -251,6 +260,7 @@ def on_connect(c, userdata, flags, rc):
         print("Connected to MQTT!")
         mqtt_connected = True
         c.publish(TOPIC_BOILER_STATE, "ok")
+        c.publish(TOPIC_ERROR_TEXT, "No errors")
 
 def main():
     global last_report_time
@@ -263,29 +273,28 @@ def main():
         client.loop_start()
     except: print("MQTT Error")
 
-    print("Starting OTGW Monitor v3.22 (Docker Edition)...")
-    send_telegram("🔄 Мониторинг запущен (Docker)")
+    print("Starting OTGW Monitor v3.25...")
+    send_telegram("🔄 <b>Мониторинг v3.25</b>: Аварийный режим + MQTT")
 
     while True:
         s = None
         try:
+            check_watchdog()
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(60)
             s.connect((OTGW_IP, OTGW_PORT))
             print("Connected to OTGW!")
+            ping_watchdog()
             
             buffer = ""
             while True:
-                current_time = time.time()
-                
-                if current_time - last_report_time > REPORT_INTERVAL:
-                    send_status_report()
-                    last_report_time = current_time
+                check_watchdog()
+                if time.time() - last_report_time > REPORT_INTERVAL:
+                    last_report_time = time.time()
 
                 try:
                     data = s.recv(1024)
                 except socket.timeout:
-                    print("Timeout listening...")
                     break 
 
                 if not data: break
@@ -299,10 +308,6 @@ def main():
                         if not clean_line: continue
                         logger.info(clean_line)
                         parse_line(clean_line)
-                        if "Error" in clean_line and "fault" not in clean_line.lower():
-                            status['errors_set'].add(clean_line)
-                            # И здесь тоже отправляем сырые ошибки шлюза
-                            if mqtt_connected: client.publish(TOPIC_ERROR, clean_line)
                 except: pass
 
         except Exception as e:
